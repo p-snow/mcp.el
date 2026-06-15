@@ -1214,7 +1214,7 @@ SYNCP specifies if the operation should be synchronous or asynchronous."
                        (message "Sadly, %s mpc server reports %s: %s"
                                 (jsonrpc-name connection) code message))))
          (args `(,connection
-                 ,method nil
+                 ,method ,(make-hash-table)
                  :timeout ,(mcp--timeout connection)
                  ,@(unless syncp `(:success-fn
                                    ,success-fn))
