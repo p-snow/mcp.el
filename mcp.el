@@ -47,7 +47,7 @@
 (require 'cl-lib)
 (require 'url)
 
-(defconst mcp--support-versions (list "2025-03-26" "2024-11-05")
+(defconst mcp--support-versions (list "2025-11-25" "2025-03-26" "2024-11-05")
   "MCP support version.")
 
 (defcustom mcp-server-start-time 60
@@ -160,6 +160,7 @@ When nil, uses `jsonrpc-default-request-timeout'."))
     :accessor mcp--tls)
    (-token
     :initarg :token
+    :initform nil
     :accessor mcp--token)
    (-headers
     :initarg :headers
@@ -316,40 +317,44 @@ The message is sent differently based on connection type:
                                         (headers-plist (mcp--parse-http-header headers))
                                         (session-id (plist-get headers-plist :mcp-session-id))
                                         (response-code (plist-get headers-plist :response-code)))
-                                   (when (string= "4"
-                                                  (substring response-code 0 1))
-                                     (setf (mcp--sse connection) t))
-                                   (when session-id
-                                     (setf (mcp--session-id connection)
-                                           session-id))
-                                   ;; connect sse
-                                   (when (and (mcp--sse connection)
-                                              (not (jsonrpc--process connection)))
-                                     (mcp--connect-sse connection))
-                                   (unless (mcp--sse connection)
-                                     (when-let* ((content-type (plist-get headers-plist :content-type))
-                                                 ((not (string= "" (string-trim body)))))
-                                       (let (data json)
-                                         (pcase (car (split-string content-type  ";" t))
-                                           ("text/event-stream"
-                                            (dolist (line (split-string body "\n"))
-                                              (cond
-                                               ((string-prefix-p "data: " line)
-                                                (setq data (string-trim (substring line 5)))))))
-                                           ("application/json"
-                                            (setq data body)))
-                                         (condition-case-unless-debug err
-                                             (when (stringp data)
-                                               (setq json (json-parse-string data
-                                                                             :object-type 'plist
-                                                                             :null-object nil
-                                                                             :false-object :json-false)))
-                                           (json-parse-error
-                                            ;; parse error and not because of incomplete json
-                                            (jsonrpc--warn "Invalid JSON: %s\t %s" (cdr err) data)))
-                                         (when json
-                                           (jsonrpc-connection-receive connection json)))))))
-                               (kill-buffer))))
+                                    (when (string= "4"
+                                                   (substring response-code 0 1))
+                                      (setf (mcp--sse connection) t))
+                                    (when session-id
+                                      (setf (mcp--session-id connection)
+                                            session-id))
+                                    ;; Establish SSE before processing JSON response,
+                                    ;; because jsonrpc-connection-receive may throw
+                                    ;; (via continuation) and skip code after it.
+                                    (when (and (not (jsonrpc--process connection))
+                                               (or (mcp--sse connection)
+                                                   (and (mcp--session-id connection)
+                                                        (eq (mcp--connection-type connection) 'http))))
+                                      (setf (mcp--sse connection) t)
+                                      (mcp--connect-sse connection))
+                                    ;; Process JSON response (may throw)
+                                    (when-let* ((content-type (plist-get headers-plist :content-type))
+                                                ((not (string= "" (string-trim body)))))
+                                      (let (data json)
+                                        (pcase (car (split-string content-type ";" t))
+                                          ("text/event-stream"
+                                           (dolist (line (split-string body "\n"))
+                                             (cond
+                                              ((string-prefix-p "data: " line)
+                                               (setq data (string-trim (substring line 5)))))))
+                                          ("application/json"
+                                           (setq data body)))
+                                        (condition-case-unless-debug err
+                                            (when (stringp data)
+                                              (setq json (json-parse-string data
+                                                                            :object-type 'plist
+                                                                            :null-object nil
+                                                                            :false-object :json-false)))
+                                          (json-parse-error
+                                           (jsonrpc--warn "Invalid JSON: %s\t %s" (cdr err) data)))
+                                        (when json
+                                          (jsonrpc-connection-receive connection json))))))
+                                (kill-buffer))))
            (set (make-local-variable 'url-mime-accept-string) url-mime-accept-string))))
       ('stdio
        (process-send-string
@@ -422,52 +427,61 @@ The message is sent differently based on connection type:
                            (message "sse not connect, return code: %s" response-code))
                        ;; can't parse headers
                        (message "can't parse headers: %s" data-block))
-                   (if (= 0 message-rest-size)
-                       (let* ((data-line (split-string data-block "\n"))
-                              (data-size-line (cl-first data-line))
-                              (event-line (cl-second data-line))
-                              (id-line (when-let* ((id-line (cl-third data-line)))
-                                         (if (string-prefix-p "id" id-line)
-                                             id-line)))
-                              (data-body (if id-line
-                                             (cl-fourth data-line)
-                                           (cl-third data-line)))
-                              (data (when data-body
-                                      (string-trim (substring data-body 6)))))
-                         (when-let* ((event-line event-line)
-                                     (data-size (string-to-number (string-trim data-size-line)
-                                                                  16))
-                                     (event-type (if (string-prefix-p ": ping" event-line)
-                                                     'ping
-                                                   (intern (string-trim (substring event-line 6)))))
-                                     (body-size (let ((len 0))
-                                                  (dolist (i (cdr data-line)) (setq len (+ len (length i))))
-                                                  (+ len (length (cdr data-line)) -1)))
-                                     (rest-size (- data-size
-                                                   2 ; \r\n after data-size
-                                                   ;; only sse need add 2
-                                                   (if (mcp--sse conn)
-                                                       2 ; \r\n after the last data-line
-                                                     0)
-                                                   body-size)))
-                           (pcase event-type
-                             ('endpoint
-                              (let* ((endpoint (if (string-match "http://[^/]+\\(/[^[:space:]]+\\)" data)
-                                                   (match-string 1 data)
-                                                 data)))
-                                (unless (mcp--endpoint conn)
-                                  (setf (mcp--endpoint conn) endpoint)
-                                  (mcp--send-initial-message conn))))
-                             ('message
-                              (if (>= 0 rest-size)
-                                  (push data
-                                        parsed-messages)
-                                (process-put proc 'jsonrpc-message-rest-size rest-size)
-                                (with-current-buffer buf
-                                  (goto-char (point-max))
-                                  (insert data))))
-                             (_))))
-                     (let* ((data-block-size (length data-block))
+                    (if (= 0 message-rest-size)
+                        (let* ((data-line (split-string data-block "\n"))
+                               (data-size-line (cl-first data-line))
+                               (event-line (cl-second data-line))
+                               (id-line (when-let* ((id-line (cl-third data-line)))
+                                          (if (string-prefix-p "id" id-line)
+                                              id-line)))
+                               (data-body (if id-line
+                                              (cl-fourth data-line)
+                                            (cl-third data-line)))
+                               (data (when data-body
+                                       (string-trim (substring data-body 6))))
+                               (standard-sse (string-prefix-p "data:" (string-trim data-size-line))))
+                          (if standard-sse
+                              ;; Standard SSE format: data: <json>\n\n
+                              (dolist (msg (split-string data-block "\n\n" t))
+                                (let ((json-str nil))
+                                  (dolist (line (split-string msg "\n"))
+                                    (when (string-prefix-p "data: " line)
+                                      (setq json-str (string-trim (substring line 6)))))
+                                  (when json-str
+                                    (push json-str parsed-messages))))
+                            ;; Legacy SSE framing (hex size + event type)
+                            (when-let* ((event-line event-line)
+                                        (data-size (string-to-number (string-trim data-size-line) 16))
+                                        (event-type (if (string-prefix-p ": ping" event-line)
+                                                        'ping
+                                                      (intern (string-trim (substring event-line 6)))))
+                                        (body-size (let ((len 0))
+                                                     (dolist (i (cdr data-line)) (setq len (+ len (length i))))
+                                                     (+ len (length (cdr data-line)) -1)))
+                                        (rest-size (- data-size
+                                                      2 ; \r\n after data-size
+                                                      (if (mcp--sse conn)
+                                                          2 ; \r\n after the last data-line
+                                                        0)
+                                                      body-size)))
+                              (pcase event-type
+                                ('endpoint
+                                 (let* ((endpoint (if (string-match "http://[^/]+\\(/[^[:space:]]+\\)" data)
+                                                      (match-string 1 data)
+                                                    data)))
+                                   (unless (mcp--endpoint conn)
+                                     (setf (mcp--endpoint conn) endpoint)
+                                     (mcp--send-initial-message conn))))
+                                ('message
+                                 (if (>= 0 rest-size)
+                                     (push data
+                                           parsed-messages)
+                                   (process-put proc 'jsonrpc-message-rest-size rest-size)
+                                   (with-current-buffer buf
+                                     (goto-char (point-max))
+                                     (insert data))))
+                                (_)))))
+                      (let* ((data-block-size (length data-block))
                             (new-message-rest-size (- message-rest-size data-block-size)))
                        (process-put proc 'jsonrpc-message-rest-size new-message-rest-size)
                        (with-current-buffer buf
@@ -582,8 +596,8 @@ The message is sent differently based on connection type:
                           "Accept: text/event-stream\r\n"
                           (when-let* ((token (mcp--resolve-value (mcp--token conn))))
                             (format "Authorization: Bearer %s\r\n" token))
-                          (unless (mcp--sse conn)
-                            (format "Mcp-Session-Id: %s\r\n" (mcp--session-id conn)))
+                          (when-let* ((session-id (mcp--session-id conn)))
+                            (format "Mcp-Session-Id: %s\r\n" session-id))
                           "Cache-Control: no-cache\r\n"
                           "Connection: keep-alive\r\n\r\n"))))
 
@@ -1139,9 +1153,11 @@ See `mcp-async-initialize-message' and `mcp-sync-initialize-message'."
                                     (jsonrpc-name connection))))))
          (args `(,connection
                  :initialize
-                 (:protocolVersion ,(car mcp--support-versions)
-                  :capabilities (:roots (:listChanged t))
-                  :clientInfo (:name "mcp-emacs" :version "0.1.0"))
+                  (:protocolVersion ,(car mcp--support-versions)
+                   :capabilities (:prompts (:listChanged t)
+                                 :resources (:listChanged t)
+                                 :tools (:listChanged t))
+                   :clientInfo (:name "mcp-emacs" :version "0.1.0"))
                  ,@(unless syncp `(:success-fn
                                    ,success-fn))
                  ,@(unless syncp `(:error-fn
